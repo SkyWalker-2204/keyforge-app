@@ -1,0 +1,868 @@
+"""
+KeyForge — single file Python version (website + backend + database, sab ek file mein)
+
+Run:
+    pip install flask
+    python app.py
+
+Phir browser mein kholo: http://localhost:4000
+
+Database: sqlite3 (Python ke built-in module se, koi extra install nahi chahiye).
+Yeh "keyforge.db" naam ki file is script ke saath hi ban jaayegi.
+"""
+
+import sqlite3
+import secrets
+import time
+from pathlib import Path
+
+from flask import Flask, request, jsonify, Response
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+PORT = 4000
+DAY_MS = 24 * 60 * 60 * 1000
+DB_FILE = Path(__file__).parent / "keyforge.db"
+
+app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# DATABASE (sqlite3 — sab kuch isi file mein)
+# ---------------------------------------------------------------------------
+def get_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id TEXT PRIMARY KEY,
+            key TEXT UNIQUE NOT NULL,
+            app_name TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            daily_limit INTEGER NOT NULL DEFAULT 1000,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            quota_reset_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS request_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def generate_api_key(scope: str) -> str:
+    env = "live" if scope == "full" else "test"
+    random_part = secrets.token_urlsafe(24)
+    return f"kf_{env}_{random_part}"
+
+
+def generate_id() -> str:
+    return secrets.token_hex(8)
+
+
+def expiry_to_timestamp(expiry: str):
+    now = now_ms()
+    if expiry == "24h":
+        return now + DAY_MS
+    if expiry == "7d":
+        return now + 7 * DAY_MS
+    if expiry == "never":
+        return None
+    return now + DAY_MS
+
+
+def scope_daily_limit(scope: str) -> int:
+    return 50000 if scope == "full" else 1000
+
+
+def public_key_view(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "key": row["key"],
+        "appName": row["app_name"],
+        "scope": row["scope"],
+        "createdAt": row["created_at"],
+        "expiresAt": row["expires_at"],
+        "revoked": bool(row["revoked"]),
+        "dailyLimit": row["daily_limit"],
+        "requestCount": row["request_count"],
+        "quotaResetAt": row["quota_reset_at"],
+    }
+
+
+SCOPE_RANK = {"read": 1, "write": 2, "full": 3}
+
+
+def validate_api_key():
+    """Returns (row_dict, error_response_or_None). Real DB-backed validation."""
+    header = request.headers.get("Authorization", "")
+    token = header[7:].strip() if header.startswith("Bearer ") else None
+
+    if not token:
+        return None, (
+            jsonify(status="error", message="Missing Authorization header. Use: Authorization: Bearer <your_api_key>"),
+            401,
+        )
+
+    conn = get_db()
+    row = conn.execute("SELECT * FROM api_keys WHERE key = ?", (token,)).fetchone()
+
+    if row is None:
+        conn.close()
+        return None, (jsonify(status="error", message="Invalid API key."), 401)
+
+    if row["revoked"]:
+        conn.close()
+        return None, (jsonify(status="error", message="This API key has been revoked."), 403)
+
+    if row["expires_at"] is not None and now_ms() > row["expires_at"]:
+        conn.close()
+        return None, (jsonify(status="error", message="This API key has expired."), 403)
+
+    request_count = row["request_count"]
+    quota_reset_at = row["quota_reset_at"]
+
+    if now_ms() > quota_reset_at:
+        request_count = 0
+        quota_reset_at = now_ms() + DAY_MS
+        conn.execute(
+            "UPDATE api_keys SET request_count = 0, quota_reset_at = ? WHERE id = ?",
+            (quota_reset_at, row["id"]),
+        )
+
+    if request_count >= row["daily_limit"]:
+        conn.close()
+        return None, (
+            jsonify(
+                status="error",
+                message="Daily rate limit exceeded.",
+                rateLimit={"remaining": 0, "limit": row["daily_limit"], "resetAt": quota_reset_at},
+            ),
+            429,
+        )
+
+    request_count += 1
+    conn.execute("UPDATE api_keys SET request_count = ? WHERE id = ?", (request_count, row["id"]))
+    conn.execute(
+        "INSERT INTO request_log (key_id, endpoint, created_at) VALUES (?, ?, ?)",
+        (row["id"], request.path, now_ms()),
+    )
+    conn.commit()
+
+    key_data = dict(row)
+    key_data["request_count"] = request_count
+    key_data["quota_reset_at"] = quota_reset_at
+    conn.close()
+
+    return key_data, None
+
+
+def require_scope(key_data: dict, min_scope: str):
+    if SCOPE_RANK[key_data["scope"]] < SCOPE_RANK[min_scope]:
+        return jsonify(status="error", message=f"This action requires '{min_scope}' scope or higher."), 403
+    return None
+
+
+# ---------------------------------------------------------------------------
+# API ROUTES — key management (dashboard calls these)
+# ---------------------------------------------------------------------------
+@app.post("/v1/keys/new")
+def create_key():
+    body = request.get_json(silent=True) or {}
+    app_name = body.get("appName")
+    scope = body.get("scope")
+    expiry = body.get("expiry")
+
+    if not app_name or not isinstance(app_name, str):
+        return jsonify(status="error", message="appName is required."), 400
+    if scope not in ("read", "write", "full"):
+        return jsonify(status="error", message="scope must be 'read', 'write', or 'full'."), 400
+    if expiry not in ("24h", "7d", "never"):
+        return jsonify(status="error", message="expiry must be '24h', '7d', or 'never'."), 400
+
+    now = now_ms()
+    row = {
+        "id": generate_id(),
+        "key": generate_api_key(scope),
+        "app_name": app_name,
+        "scope": scope,
+        "created_at": now,
+        "expires_at": expiry_to_timestamp(expiry),
+        "revoked": 0,
+        "daily_limit": scope_daily_limit(scope),
+        "request_count": 0,
+        "quota_reset_at": now + DAY_MS,
+    }
+
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO api_keys (id, key, app_name, scope, created_at, expires_at, revoked, daily_limit, request_count, quota_reset_at)
+        VALUES (:id, :key, :app_name, :scope, :created_at, :expires_at, :revoked, :daily_limit, :request_count, :quota_reset_at)
+        """,
+        row,
+    )
+    conn.commit()
+    saved = conn.execute("SELECT * FROM api_keys WHERE id = ?", (row["id"],)).fetchone()
+    conn.close()
+
+    return jsonify(status="ok", data=public_key_view(saved)), 201
+
+
+@app.get("/v1/keys")
+def list_keys():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM api_keys ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return jsonify(status="ok", data=[public_key_view(r) for r in rows])
+
+
+@app.delete("/v1/keys/<key_id>")
+def revoke_key(key_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify(status="error", message="Key not found."), 404
+
+    conn.execute("UPDATE api_keys SET revoked = 1 WHERE id = ?", (key_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(status="ok", message="Key revoked.")
+
+
+# ---------------------------------------------------------------------------
+# API ROUTES — real protected sandbox endpoints (require a valid key)
+# ---------------------------------------------------------------------------
+@app.get("/v1/users")
+def get_users():
+    key_data, err = validate_api_key()
+    if err:
+        return err
+    scope_err = require_scope(key_data, "read")
+    if scope_err:
+        return scope_err
+
+    return jsonify(
+        status="ok",
+        data=[
+            {"id": 1, "name": "Aarav Sharma", "email": "aarav@example.com"},
+            {"id": 2, "name": "Priya Nair", "email": "priya@example.com"},
+            {"id": 3, "name": "Rohan Mehta", "email": "rohan@example.com"},
+        ],
+        rateLimit={
+            "remaining": key_data["daily_limit"] - key_data["request_count"],
+            "limit": key_data["daily_limit"],
+            "resetAt": key_data["quota_reset_at"],
+        },
+    )
+
+
+@app.post("/v1/users")
+def create_user():
+    key_data, err = validate_api_key()
+    if err:
+        return err
+    scope_err = require_scope(key_data, "write")
+    if scope_err:
+        return scope_err
+
+    body = request.get_json(silent=True) or {}
+    return jsonify(
+        status="ok",
+        message="User created (sandbox — not actually persisted).",
+        data={"id": now_ms(), **body},
+    ), 201
+
+
+@app.delete("/v1/users/<user_id>")
+def delete_user(user_id):
+    key_data, err = validate_api_key()
+    if err:
+        return err
+    scope_err = require_scope(key_data, "full")
+    if scope_err:
+        return scope_err
+
+    return jsonify(status="ok", message=f"User {user_id} deleted (sandbox).")
+
+
+# ---------------------------------------------------------------------------
+# FRONTEND — same file mein, same server se serve hoti hai
+# ---------------------------------------------------------------------------
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KeyForge — Free API Keys for Developers</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #0B0E14;
+    --panel: #131822;
+    --panel-2: #0F141D;
+    --border: #232B3A;
+    --text: #E6EDF3;
+    --text-dim: #8B96A8;
+    --amber: #FFB454;
+    --cyan: #5CCFE6;
+    --green: #7CD68C;
+    --red: #FF7B72;
+    --radius: 10px;
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'Inter', sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  body::before{
+    content:"";
+    position:fixed; inset:0;
+    background-image: linear-gradient(rgba(124,213,140,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(124,213,140,0.025) 1px, transparent 1px);
+    background-size: 42px 42px;
+    pointer-events:none;
+    z-index:0;
+  }
+  .wrap{max-width:1120px; margin:0 auto; padding:0 28px; position:relative; z-index:1;}
+  a{color:inherit; text-decoration:none;}
+  code, .mono{font-family:var(--mono);}
+  nav{
+    position:sticky; top:0; z-index:50;
+    background:rgba(11,14,20,0.85);
+    backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--border);
+  }
+  nav .wrap{display:flex; align-items:center; justify-content:space-between; height:64px;}
+  .brand{display:flex; align-items:center; gap:10px; font-family:var(--mono); font-weight:700; font-size:17px; letter-spacing:-0.02em;}
+  .brand .dot{width:9px; height:9px; border-radius:50%; background:var(--amber); box-shadow:0 0 12px var(--amber); animation:pulse 2s infinite;}
+  @keyframes pulse{0%,100%{opacity:1;} 50%{opacity:0.4;}}
+  .navlinks{display:flex; gap:30px; align-items:center;}
+  .navlinks a{font-size:14px; color:var(--text-dim); transition:color .15s;}
+  .navlinks a:hover{color:var(--text);}
+  .nav-cta{background:var(--amber); color:#1a1206; padding:9px 18px; border-radius:7px; font-weight:700; font-size:13.5px; font-family:var(--mono);}
+  .nav-cta:hover{filter:brightness(1.08);}
+  header.hero{padding:90px 0 70px; position:relative; overflow:hidden;}
+  .eyebrow{
+    display:inline-flex; align-items:center; gap:8px;
+    font-family:var(--mono); font-size:12.5px; color:var(--cyan);
+    border:1px solid rgba(92,207,230,0.3); background:rgba(92,207,230,0.06);
+    padding:6px 12px; border-radius:20px; margin-bottom:24px;
+  }
+  .hero-grid{display:grid; grid-template-columns:1.05fr 0.95fr; gap:50px; align-items:center;}
+  h1{
+    font-family:var(--mono); font-size:46px; font-weight:800; line-height:1.12;
+    letter-spacing:-0.02em; margin-bottom:20px;
+  }
+  h1 .accent{color:var(--amber);}
+  h1 .accent2{color:var(--cyan);}
+  .hero p.sub{color:var(--text-dim); font-size:16.5px; max-width:480px; margin-bottom:32px;}
+  .hero-actions{display:flex; gap:14px; flex-wrap:wrap;}
+  .btn-primary{
+    background:var(--amber); color:#1a1206; font-weight:700; font-family:var(--mono);
+    padding:14px 24px; border-radius:8px; font-size:14.5px; border:none; cursor:pointer;
+    box-shadow:0 0 0 0 rgba(255,180,84,0.5); transition:all .2s;
+  }
+  .btn-primary:hover{transform:translateY(-2px); box-shadow:0 8px 20px rgba(255,180,84,0.18);}
+  .btn-ghost{
+    background:transparent; color:var(--text); border:1px solid var(--border);
+    padding:14px 24px; border-radius:8px; font-size:14.5px; font-family:var(--mono); font-weight:600;
+    cursor:pointer; transition:all .2s;
+  }
+  .btn-ghost:hover{border-color:var(--text-dim);}
+  .hero-meta{display:flex; gap:26px; margin-top:34px; flex-wrap:wrap;}
+  .hero-meta div{font-family:var(--mono); font-size:12.5px; color:var(--text-dim);}
+  .hero-meta strong{display:block; color:var(--text); font-size:20px; font-weight:800;}
+  .terminal{
+    background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    overflow:hidden; box-shadow:0 30px 60px -20px rgba(0,0,0,0.6);
+  }
+  .term-bar{
+    display:flex; align-items:center; gap:8px; padding:12px 16px;
+    background:var(--panel-2); border-bottom:1px solid var(--border);
+  }
+  .term-bar span{width:11px; height:11px; border-radius:50%;}
+  .term-bar span:nth-child(1){background:#FF5F56;}
+  .term-bar span:nth-child(2){background:#FFBD2E;}
+  .term-bar span:nth-child(3){background:#27C93F;}
+  .term-title{margin-left:6px; font-family:var(--mono); font-size:12px; color:var(--text-dim);}
+  .term-body{padding:22px; font-family:var(--mono); font-size:13.5px; min-height:260px;}
+  .term-line{margin-bottom:10px; color:var(--text-dim);}
+  .term-line .prompt{color:var(--green);}
+  .term-line .cmd{color:var(--text);}
+  .term-out{color:var(--cyan); margin-bottom:4px;}
+  .key-line{
+    color:var(--amber); background:rgba(255,180,84,0.08); padding:8px 10px;
+    border-radius:6px; margin:10px 0; display:flex; justify-content:space-between; align-items:center;
+    gap:10px; word-break:break-all; border:1px solid rgba(255,180,84,0.2);
+  }
+  .key-line button{
+    background:none; border:1px solid rgba(255,180,84,0.4); color:var(--amber);
+    font-family:var(--mono); font-size:11px; padding:4px 9px; border-radius:5px; cursor:pointer; flex-shrink:0;
+  }
+  .key-line button:hover{background:rgba(255,180,84,0.15);}
+  .cursor{display:inline-block; width:7px; height:14px; background:var(--cyan); animation:blink 1s step-end infinite; vertical-align:middle;}
+  @keyframes blink{50%{opacity:0;}}
+  section{padding:90px 0; border-top:1px solid var(--border); position:relative;}
+  .sec-head{margin-bottom:48px; max-width:600px;}
+  .sec-eyebrow{font-family:var(--mono); font-size:12px; color:var(--amber); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:12px;}
+  h2{font-family:var(--mono); font-size:30px; font-weight:800; letter-spacing:-0.01em; margin-bottom:14px;}
+  .sec-head p{color:var(--text-dim); font-size:15.5px;}
+  .feat-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--border); border:1px solid var(--border); border-radius:12px; overflow:hidden;}
+  .feat{background:var(--panel); padding:30px 26px;}
+  .feat .num{font-family:var(--mono); font-size:12px; color:var(--text-dim); margin-bottom:14px;}
+  .feat h3{font-size:16.5px; font-weight:700; margin-bottom:9px;}
+  .feat p{color:var(--text-dim); font-size:14px;}
+  .dash{
+    background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:36px;
+  }
+  .dash-top{display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:18px; margin-bottom:26px;}
+  .dash-top h3{font-family:var(--mono); font-size:19px; font-weight:700;}
+  .dash-top p{color:var(--text-dim); font-size:13.5px; margin-top:6px;}
+  .gen-form{display:flex; gap:12px; flex-wrap:wrap; margin-bottom:26px;}
+  .gen-form input, .gen-form select{
+    background:var(--panel-2); border:1px solid var(--border); color:var(--text);
+    padding:12px 14px; border-radius:8px; font-family:var(--sans); font-size:14px; flex:1; min-width:180px;
+  }
+  .gen-form input:focus, .gen-form select:focus{outline:2px solid var(--cyan); outline-offset:1px; border-color:var(--cyan);}
+  .gen-form button{
+    background:var(--cyan); color:#06222b; font-weight:700; border:none; border-radius:8px;
+    padding:12px 22px; font-family:var(--mono); font-size:14px; cursor:pointer; transition:all .2s;
+  }
+  .gen-form button:hover{filter:brightness(1.08); transform:translateY(-1px);}
+  table{width:100%; border-collapse:collapse;}
+  thead th{
+    text-align:left; font-family:var(--mono); font-size:11.5px; text-transform:uppercase; letter-spacing:0.05em;
+    color:var(--text-dim); padding:10px 12px; border-bottom:1px solid var(--border);
+  }
+  tbody td{padding:14px 12px; border-bottom:1px solid var(--border); font-size:13.5px;}
+  tbody tr:last-child td{border-bottom:none;}
+  .key-cell{font-family:var(--mono); color:var(--amber); display:flex; align-items:center; gap:8px;}
+  .pill{
+    font-family:var(--mono); font-size:11px; padding:3px 9px; border-radius:20px; display:inline-block;
+  }
+  .pill.active{background:rgba(124,214,140,0.12); color:var(--green); border:1px solid rgba(124,214,140,0.3);}
+  .pill.revoked{background:rgba(255,123,114,0.12); color:var(--red); border:1px solid rgba(255,123,114,0.3);}
+  .icon-btn{background:none; border:1px solid var(--border); color:var(--text-dim); border-radius:6px; padding:5px 9px; cursor:pointer; font-size:12px; font-family:var(--mono);}
+  .icon-btn:hover{color:var(--text); border-color:var(--text-dim);}
+  .empty-row td{color:var(--text-dim); text-align:center; padding:34px 12px; font-family:var(--mono); font-size:13px;}
+  .tier-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:18px;}
+  .tier{background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:30px; display:flex; flex-direction:column;}
+  .tier.featured{border-color:var(--amber); box-shadow:0 0 0 1px var(--amber), 0 20px 40px -20px rgba(255,180,84,0.25);}
+  .tier .tag{font-family:var(--mono); font-size:11px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.06em; margin-bottom:6px;}
+  .tier.featured .tag{color:var(--amber);}
+  .tier h3{font-size:22px; font-weight:800; margin-bottom:4px;}
+  .tier .price{font-family:var(--mono); font-size:13px; color:var(--text-dim); margin-bottom:22px;}
+  .tier .price b{color:var(--text); font-size:26px;}
+  .tier ul{list-style:none; flex:1; margin-bottom:22px;}
+  .tier li{font-size:13.5px; color:var(--text-dim); padding:7px 0; display:flex; gap:9px;}
+  .tier li::before{content:"✓"; color:var(--green); font-weight:700;}
+  .tier button{width:100%;}
+  .code-block{
+    background:var(--panel-2); border:1px solid var(--border); border-radius:10px; padding:22px;
+    font-family:var(--mono); font-size:13px; overflow-x:auto; color:var(--text-dim); line-height:1.7;
+  }
+  .code-block .k{color:var(--cyan);} .code-block .s{color:var(--amber);} .code-block .c{color:var(--text-dim);}
+  footer{border-top:1px solid var(--border); padding:40px 0; }
+  footer .wrap{display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;}
+  footer p{color:var(--text-dim); font-size:13px; font-family:var(--mono);}
+  @media(max-width:880px){
+    .hero-grid{grid-template-columns:1fr;}
+    .feat-grid{grid-template-columns:1fr;}
+    .tier-grid{grid-template-columns:1fr;}
+    h1{font-size:34px;}
+    .navlinks{display:none;}
+    table{font-size:12px;}
+  }
+  ::selection{background:var(--amber); color:#1a1206;}
+  :focus-visible{outline:2px solid var(--cyan); outline-offset:2px;}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="brand"><span class="dot"></span>KeyForge<span style="color:var(--text-dim); font-weight:500;">.dev</span></div>
+    <div class="navlinks">
+      <a href="#generator">Generator</a>
+      <a href="#features">Features</a>
+      <a href="#pricing">Pricing</a>
+      <a href="#docs">Docs</a>
+    </div>
+    <a href="#generator" class="nav-cta">Get API Key →</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <div class="eyebrow"><span class="dot" style="background:var(--cyan); box-shadow:0 0 10px var(--cyan);"></span> 100% Free • No credit card</div>
+      <h1>Generate API keys<br>in <span class="accent">3 seconds</span>,<br>not <span class="accent2">3 forms</span>.</h1>
+      <p class="sub">KeyForge ek free playground hai jahan developers fake-data, auth-testing aur prototyping ke liye instant API keys bana sakte hain — bina signup ke jhanjhat ke.</p>
+      <div class="hero-actions">
+        <button class="btn-primary" onclick="document.getElementById('generator').scrollIntoView({behavior:'smooth'})">Generate Free Key</button>
+        <a href="#docs"><button class="btn-ghost">View Documentation</button></a>
+      </div>
+      <div class="hero-meta">
+        <div><strong id="statKeys">12,480+</strong>Keys issued today</div>
+        <div><strong>99.98%</strong>Uptime</div>
+        <div><strong>&lt;40ms</strong>Avg latency</div>
+      </div>
+    </div>
+
+    <div class="terminal">
+      <div class="term-bar"><span></span><span></span><span></span><div class="term-title">bash — keyforge-cli</div></div>
+      <div class="term-body" id="heroTerminal">
+        <div class="term-line"><span class="prompt">$</span> <span class="cmd">curl -X POST keyforge.dev/v1/keys/new</span></div>
+        <div class="term-out">⏳ generating secure token...</div>
+        <div class="key-line">
+          <span id="heroKey">kf_live_a83Jd92mZqLp7xT4vR1nQ9wY</span>
+          <button onclick="copyText('heroKey', this)">copy</button>
+        </div>
+        <div class="term-line" style="color:var(--green);">✓ key active · rate limit 1000 req/day</div>
+        <div class="term-line"><span class="prompt">$</span> <span class="cursor"></span></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Why KeyForge</div>
+      <h2>Built for developers who hate paperwork</h2>
+      <p>Sign-up forms, email verification, billing approval — humne sab kaat diya. Sirf ek button, ek key.</p>
+    </div>
+    <div class="feat-grid">
+      <div class="feat">
+        <div class="num">01</div>
+        <h3>Instant Generation</h3>
+        <p>Ek click mein cryptographically random API key — koi waiting queue nahi, koi approval email nahi.</p>
+      </div>
+      <div class="feat">
+        <div class="num">02</div>
+        <h3>Scoped Permissions</h3>
+        <p>Read-only, write, ya full-access scope choose karo — testing environment ke hisaab se control rakho.</p>
+      </div>
+      <div class="feat">
+        <div class="num">03</div>
+        <h3>Auto-Expiry</h3>
+        <p>Keys ko 24h, 7d ya never expire set karo, taaki test keys production mein accidentally leak na ho.</p>
+      </div>
+      <div class="feat">
+        <div class="num">04</div>
+        <h3>Live Rate Limits</h3>
+        <p>Har key ke saath dashboard mein real-time request count aur remaining quota dikhता है।</p>
+      </div>
+      <div class="feat">
+        <div class="num">05</div>
+        <h3>One-Click Revoke</h3>
+        <p>Key leak ho jaaye toh ek click mein turant revoke — naya key generate karo bina downtime ke.</p>
+      </div>
+      <div class="feat">
+        <div class="num">06</div>
+        <h3>Sandbox Endpoints</h3>
+        <p>Fake JSON data, mock auth aur dummy webhooks ke saath turant integrate karke test karo.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="generator">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Try it now</div>
+      <h2>Generate your key — right here</h2>
+      <p>Yeh real backend se connected hai. Naam aur scope daalo, key database mein save hokar turant ban jaayegi.</p>
+    </div>
+
+    <div class="dash">
+      <div class="dash-top">
+        <div>
+          <h3>🔑 Key Generator</h3>
+          <p>Generated keys is server ke sqlite database mein permanently save hoti hain.</p>
+        </div>
+      </div>
+
+      <div class="gen-form">
+        <input type="text" id="appName" placeholder="App / project ka naam (e.g. weather-bot)" />
+        <select id="scope">
+          <option value="read">Scope: Read-only</option>
+          <option value="write">Scope: Read + Write</option>
+          <option value="full">Scope: Full Access</option>
+        </select>
+        <select id="expiry">
+          <option value="24h">Expires: 24 hours</option>
+          <option value="7d">Expires: 7 days</option>
+          <option value="never">Expires: Never</option>
+        </select>
+        <button onclick="generateKey()">⚡ Generate Key</button>
+      </div>
+
+      <table>
+        <thead>
+          <tr><th>App</th><th>API Key</th><th>Scope</th><th>Expiry</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody id="keyTableBody">
+          <tr class="empty-row" id="emptyRow"><td colspan="6">Abhi koi key generate nahi hui — upar form bharo aur shuru karo.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="docs">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Quick start</div>
+      <h2>Use your key in 30 seconds</h2>
+      <p>Apni generated key ko header mein daalo aur kisi bhi sandbox endpoint ko call karo.</p>
+    </div>
+    <div class="code-block">
+<span class="c">// 1. Apni key request header mein daalo</span><br>
+<span class="k">curl</span> http://localhost:4000/v1/users \<br>
+&nbsp;&nbsp;-H <span class="s">"Authorization: Bearer kf_live_xxxxxxxxxxxx"</span><br><br>
+<span class="c">// 2. JSON response milega</span><br>
+{<br>
+&nbsp;&nbsp;<span class="k">"status"</span>: <span class="s">"ok"</span>,<br>
+&nbsp;&nbsp;<span class="k">"data"</span>: [ ... ],<br>
+&nbsp;&nbsp;<span class="k">"rateLimit"</span>: { <span class="k">"remaining"</span>: 998, <span class="k">"reset"</span>: <span class="s">"3600s"</span> }<br>
+}
+    </div>
+  </div>
+</section>
+
+<section id="pricing">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Pricing</div>
+      <h2>Free forever. Pro for serious load.</h2>
+      <p>Zyaadatar developers ke liye free tier hi kaafi hai — koi hidden charge nahi.</p>
+    </div>
+    <div class="tier-grid">
+      <div class="tier">
+        <div class="tag">Hobby</div>
+        <h3>Free</h3>
+        <div class="price"><b>₹0</b> /forever</div>
+        <ul>
+          <li>1,000 requests/day</li>
+          <li>5 active keys</li>
+          <li>Read-only + write scope</li>
+          <li>Community support</li>
+        </ul>
+        <button class="btn-ghost" style="width:100%;" onclick="document.getElementById('generator').scrollIntoView({behavior:'smooth'})">Start Free</button>
+      </div>
+      <div class="tier featured">
+        <div class="tag">Most Popular</div>
+        <h3>Pro</h3>
+        <div class="price"><b>₹499</b> /month</div>
+        <ul>
+          <li>50,000 requests/day</li>
+          <li>Unlimited keys</li>
+          <li>Full access scope</li>
+          <li>Priority email support</li>
+          <li>Custom expiry rules</li>
+        </ul>
+        <button class="btn-primary" style="width:100%;">Upgrade to Pro</button>
+      </div>
+      <div class="tier">
+        <div class="tag">Team</div>
+        <h3>Scale</h3>
+        <div class="price"><b>Custom</b> pricing</div>
+        <ul>
+          <li>Unlimited requests</li>
+          <li>Team-shared key vault</li>
+          <li>SSO + audit logs</li>
+          <li>Dedicated support</li>
+        </ul>
+        <button class="btn-ghost" style="width:100%;">Contact Sales</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>© 2026 KeyForge.dev — built for developers, not for forms.</p>
+    <p>Python + Flask + sqlite3 — single file backend</p>
+  </div>
+</footer>
+
+<script>
+const API_BASE = '';
+const tbody = document.getElementById('keyTableBody');
+const emptyRow = document.getElementById('emptyRow');
+const keyIdMap = {};
+
+async function loadExistingKeys(){
+  try{
+    const res = await fetch(API_BASE + '/v1/keys');
+    const json = await res.json();
+    if(json.status === 'ok' && json.data.length){
+      if(emptyRow) emptyRow.remove();
+      json.data.forEach(addKeyRow);
+    }
+  }catch(err){
+    showConnectionError();
+  }
+}
+
+async function generateKey(){
+  const appName = document.getElementById('appName').value.trim() || 'untitled-app';
+  const scope = document.getElementById('scope').value;
+  const expiry = document.getElementById('expiry').value;
+  const btn = document.querySelector('.gen-form button');
+  const oldText = btn.textContent;
+  btn.textContent = 'generating...';
+  btn.disabled = true;
+
+  try{
+    const res = await fetch(API_BASE + '/v1/keys/new', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ appName, scope, expiry })
+    });
+    const json = await res.json();
+
+    if(json.status !== 'ok'){
+      alert('Error: ' + json.message);
+      return;
+    }
+
+    if(emptyRow) emptyRow.remove();
+    addKeyRow(json.data, true);
+    document.getElementById('appName').value = '';
+
+    const statEl = document.getElementById('statKeys');
+    const cur = parseInt(statEl.textContent.replace(/[^0-9]/g,'')) || 12480;
+    statEl.textContent = (cur+1).toLocaleString('en-IN') + '+';
+  }catch(err){
+    showConnectionError();
+  }finally{
+    btn.textContent = oldText;
+    btn.disabled = false;
+  }
+}
+
+function addKeyRow(data, prepend){
+  const keyId = 'k_' + data.id;
+  keyIdMap[keyId] = data.id;
+
+  const scopeLabel = {read:'Read-only', write:'Read+Write', full:'Full Access'}[data.scope];
+  const expiryLabel = data.expiresAt ? new Date(data.expiresAt).toLocaleDateString('en-IN') : 'Never';
+  const statusClass = data.revoked ? 'revoked' : 'active';
+  const statusText = data.revoked ? 'revoked' : 'active';
+
+  const row = document.createElement('tr');
+  row.id = 'row-' + keyId;
+  row.innerHTML = `
+    <td>${escapeHtml(data.appName)}</td>
+    <td><span class="key-cell"><span id="${keyId}">${data.key}</span><button class="icon-btn" onclick="copyText('${keyId}', this)">copy</button></span></td>
+    <td>${scopeLabel}</td>
+    <td>${expiryLabel}</td>
+    <td><span class="pill ${statusClass}" id="status-${keyId}">${statusText}</span></td>
+    <td><button class="icon-btn" onclick="revokeKey('${keyId}')" ${data.revoked ? 'disabled style="opacity:0.4;cursor:not-allowed;"' : ''}>revoke</button></td>
+  `;
+  if(prepend) tbody.prepend(row); else tbody.appendChild(row);
+}
+
+async function revokeKey(keyId){
+  const realId = keyIdMap[keyId];
+  try{
+    const res = await fetch(API_BASE + '/v1/keys/' + realId, { method:'DELETE' });
+    const json = await res.json();
+    if(json.status !== 'ok'){
+      alert('Error: ' + json.message);
+      return;
+    }
+    const status = document.getElementById('status-' + keyId);
+    status.textContent = 'revoked';
+    status.className = 'pill revoked';
+    const row = document.getElementById('row-' + keyId);
+    const revokeBtn = row.querySelector('button[onclick^="revokeKey"]');
+    if(revokeBtn){ revokeBtn.disabled = true; revokeBtn.style.opacity = '0.4'; revokeBtn.style.cursor='not-allowed'; }
+  }catch(err){
+    showConnectionError();
+  }
+}
+
+function showConnectionError(){
+  if(document.getElementById('connErr')) return;
+  const banner = document.createElement('div');
+  banner.id = 'connErr';
+  banner.style.cssText = 'background:rgba(255,123,114,0.12);border:1px solid rgba(255,123,114,0.3);color:#FF7B72;padding:12px 16px;border-radius:8px;font-family:var(--mono);font-size:13px;margin-bottom:20px;';
+  banner.textContent = '⚠ Backend se connect nahi ho paya. Terminal mein "python app.py" chala kar is page ko http://localhost:4000 par open karo.';
+  document.querySelector('.dash').prepend(banner);
+}
+
+window.addEventListener('DOMContentLoaded', loadExistingKeys);
+
+function copyText(elId, btn){
+  const text = document.getElementById(elId).textContent;
+  navigator.clipboard.writeText(text).then(()=>{
+    const old = btn.textContent;
+    btn.textContent = 'copied!';
+    setTimeout(()=>{ btn.textContent = old; }, 1400);
+  }).catch(()=>{
+    btn.textContent = 'failed';
+  });
+}
+
+function escapeHtml(str){
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+</script>
+
+</body>
+</html>
+"""
+
+
+@app.get("/")
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+
+# ---------------------------------------------------------------------------
+# ENTRYPOINT
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    init_db()
+    print(f"✓ KeyForge (Python) running -> http://localhost:{PORT}")
+    print("  Website + backend + database — sab is ek file (app.py) se chal rahe hain.")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
